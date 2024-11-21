@@ -291,6 +291,8 @@ class Qwen2ForCausalLM(nn.Module):
         input_ids: torch.LongTensor = None,
         input_positions: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
+        masked_gates: Optional[torch.Tensor] = None,
+        return_hidden: bool = False
     ) -> torch.FloatTensor:
 
         outputs = self.model(
@@ -298,5 +300,8 @@ class Qwen2ForCausalLM(nn.Module):
             input_positions=input_positions,
             attention_mask=attention_mask,
         )
+
+        if return_hidden:
+            return outputs
 
         return self.lm_head(outputs)
