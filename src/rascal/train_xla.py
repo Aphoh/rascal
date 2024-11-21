@@ -8,6 +8,7 @@ import torch_xla.runtime as xr
 
 import time
 import itertools
+from .data.dummy import get_dummy_loader
 
 import torch
 import torch_xla
@@ -22,16 +23,17 @@ class TrainDecoderOnlyBase:
     def __init__(self):
         self.config = Qwen2Config()
         self.batch_size = 16
-        self.seq_len = 512
+        self.seq_len = self.config.max_position_embeddings
         self.num_steps = 200
         self.num_epochs = 1
         self.train_dataset_len = 1200000  # Roughly the size of Imagenet dataset.
         # For the purpose of this example, we are going to use fake data.
-        train_loader = xu.SampleGenerator(
-            data=torch.zeros(
-                    self.batch_size, self.seq_len, dtype=torch.int64
-                ),
-            sample_count=self.train_dataset_len // self.batch_size,
+        train_loader = get_dummy_loader(
+            self.train_dataset_len,
+            self.config.vocab_size,
+            self.config.max_position_embeddings,
+            self.config.pad_token_id,
+            self.batch_size,
         )
 
         self.device = torch_xla.device()
@@ -43,6 +45,9 @@ class TrainDecoderOnlyBase:
         self.compiled_step_fn = torch_xla.compile(
             self.step_fn, full_graph=True, name="decoder_step_fn"
         )
+        self.compiled_suffix_hiddens_fn = torch_xla.compile(
+            self.get_suffix_hiddens, full_graph=True, name="suffix_hiddens_fn"
+        )
 
     def _train_update(self, step, loss, tracker, epoch):
         print(f"epoch: {epoch}, step: {step}, loss: {loss}, rate: {tracker.rate()}")
@@ -50,10 +55,19 @@ class TrainDecoderOnlyBase:
     def run_optimizer(self):
         self.optimizer.step()
 
+    @torch.no_grad()
+    def get_suffix_hiddens(self, input_ids, input_positions, suffix_idxs):
+        hiddens = self.model(input_ids=input_ids, input_positions=input_positions)
+        suffix_indices = suffix_idxs.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, hiddens.shape[-1])
+        res = hiddens.gather(1, suffix_indices).squeeze(1)
+        return res
+
     def step_fn(self, input_ids, input_positions):
         self.optimizer.zero_grad()
         logits = self.model(input_ids=input_ids, input_positions=input_positions)
-        loss = self.loss_fn(logits[:, :-1].view(-1, self.config.vocab_size), input_ids[:, 1:].view(-1))
+        loss = self.loss_fn(
+            logits[:, :-1].view(-1, self.config.vocab_size), input_ids[:, 1:].view(-1)
+        )
         loss.backward()
         self.run_optimizer()
         return loss
@@ -62,8 +76,18 @@ class TrainDecoderOnlyBase:
         tracker = xm.RateTracker()
         self.model.train()
         loader = itertools.islice(loader, self.num_steps)
-        for step, input_ids in enumerate(loader):
-            loss = self.compiled_step_fn(input_ids, torch.arange(0, self.seq_len, device=self.device))
+        for step, data in enumerate(loader):
+            input_ids = data["sequence"]
+            lens = data["length"]
+            suffix_idxs = data["suffix_idx"]
+            input_positions = torch.arange(0, self.seq_len, device=self.device)
+            router_inputs = self.compiled_suffix_hiddens_fn(
+                input_ids, input_positions, suffix_idxs
+            )
+            # TODO: use them in the model
+            loss = self.compiled_step_fn(
+                input_ids, 
+            )
             tracker.add(self.batch_size)
             if step % 10 == 0:
                 xm.add_step_closure(
