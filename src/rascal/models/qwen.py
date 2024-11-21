@@ -10,6 +10,16 @@ import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from dataclasses import dataclass
 
+has_torch_xla = False
+
+try:
+    import torch_xla.distributed.spmd.xla_sharding as xs
+    has_torch_xla = True
+except ImportError:
+    print("torch_xla not found. not using in qwen")
+    pass
+    
+
 
 @dataclass
 class Qwen2Config:
@@ -223,6 +233,17 @@ class Qwen2DecoderLayer(nn.Module):
         return hidden_states
 
 
+    def mark_sharding(self, mesh):
+        xs.mark_sharding(self.self_attn.q_proj, mesh, ('data', 'model'))
+        xs.mark_sharding(self.self_attn.k_proj, mesh, ('data', 'model'))
+        xs.mark_sharding(self.self_attn.v_proj, mesh, ('data', 'model'))
+        xs.mark_sharding(self.self_attn.o_proj, mesh, ('model', 'data'))
+
+        xs.mark_sharding(self.mlp.gate_proj, mesh, ('model', 'data'))
+        xs.mark_sharding(self.mlp.up_proj, mesh, ('model', 'data'))
+        xs.mark_sharding(self.mlp.down_proj, mesh, ('data', 'model'))
+
+
 class Qwen2Model(nn.Module):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`Qwen2DecoderLayer`]
@@ -305,3 +326,17 @@ class Qwen2ForCausalLM(nn.Module):
             return outputs
 
         return self.lm_head(outputs)
+
+    def to_bf16(self):
+        freqs_cis = self.model.freqs_cis.clone()
+        self.model = self.model.to(torch.bfloat16)
+        self.model.freqs_cis = freqs_cis
+        self.lm_head = self.lm_head.to(torch.bfloat16)
+        return self
+
+    def mark_sharding(self, mesh):
+        for layer in self.model.layers:
+            layer.mark_sharding(mesh)
+        xs.mark_sharding(self.lm_head, mesh, ('model', 'data'))
+        xs.mark_sharding(self.model.embed_tokens, mesh, ('model', 'data'))
+
