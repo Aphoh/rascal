@@ -41,7 +41,6 @@ class RoutedLoraLLM(nn.Module):
         hiddens = self.get_suffix_hiddens(llm_inputs, suffix_idx)
         masked_gates = self.router(hiddens)
         logits = self.llm(masked_gates=masked_gates, **llm_inputs)
-        target_mask = torch.arange()
         target_mask = (
             torch.arange(0, s, device=logits.device)[None, :] > suffix_idx[:, None]
         )
@@ -49,7 +48,7 @@ class RoutedLoraLLM(nn.Module):
             torch.arange(0, s, device=logits.device)[None, :] < lens[:, None]
         )
         num_tokens = target_mask.sum()
-        targets = -100 * (1 - target_mask) + target_mask * llm_inputs["input_ids"]
+        targets = -100 * ~target_mask + target_mask * llm_inputs["input_ids"]
         targets = targets[:, 1:].view(-1)
         logits = logits[:, :-1].view(-1, logits.shape[-1])
         loss = F.cross_entropy(logits, targets, ignore_index=-100, reduction="sum")
