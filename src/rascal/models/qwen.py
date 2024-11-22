@@ -10,16 +10,6 @@ import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from dataclasses import dataclass
 
-has_torch_xla = False
-
-try:
-    import torch_xla.distributed.spmd.xla_sharding as xs
-    has_torch_xla = True
-except ImportError:
-    print("torch_xla not found. not using in qwen")
-    pass
-    
-
 
 @dataclass
 class Qwen2Config:
@@ -123,6 +113,7 @@ class Qwen2Attention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
@@ -144,6 +135,8 @@ class Qwen2Attention(nn.Module):
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
+
+        self.attn_impl = F.scaled_dot_product_attention
 
     def forward(
         self,
@@ -173,10 +166,15 @@ class Qwen2Attention(nn.Module):
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
+        # [B, n_kv_head, S, head_dim] -> [B, n_head, S, head_dim]
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        # [B, n_kv_head, S, head_dim] -> [B, n_head, S, head_dim]
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
         enable_gqa = self.num_heads != self.num_key_value_heads
         is_causal = True if attention_mask is not None else False
 
-        attn_output = F.scaled_dot_product_attention(
+        attn_output = self.attn_impl(
             query_states,
             key_states,
             value_states,
@@ -231,18 +229,6 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states
-
-
-    def mark_sharding(self, mesh):
-        xs.mark_sharding(self.self_attn.q_proj, mesh, ('data', 'model'))
-        xs.mark_sharding(self.self_attn.k_proj, mesh, ('data', 'model'))
-        xs.mark_sharding(self.self_attn.v_proj, mesh, ('data', 'model'))
-        xs.mark_sharding(self.self_attn.o_proj, mesh, ('model', 'data'))
-
-        xs.mark_sharding(self.mlp.gate_proj, mesh, ('model', 'data'))
-        xs.mark_sharding(self.mlp.up_proj, mesh, ('model', 'data'))
-        xs.mark_sharding(self.mlp.down_proj, mesh, ('data', 'model'))
-
 
 class Qwen2Model(nn.Module):
     """
@@ -333,10 +319,3 @@ class Qwen2ForCausalLM(nn.Module):
         self.model.freqs_cis = freqs_cis
         self.lm_head = self.lm_head.to(torch.bfloat16)
         return self
-
-    def mark_sharding(self, mesh):
-        for layer in self.model.layers:
-            layer.mark_sharding(mesh)
-        xs.mark_sharding(self.lm_head, mesh, ('model', 'data'))
-        xs.mark_sharding(self.model.embed_tokens, mesh, ('model', 'data'))
-

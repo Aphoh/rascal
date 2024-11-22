@@ -36,7 +36,7 @@ class RoutedLoraLLM(nn.Module):
         res = hiddens.gather(1, suffix_indices).squeeze(1)
         return res
 
-    def compute_loss(self, llm_inputs: dict, suffix_idx: torch.Tensor, lens: torch.Tensor) -> tuple[torch.Tensor, int]:
+    def forward(self, llm_inputs: dict, suffix_idx: torch.Tensor, lens: torch.Tensor) -> tuple[torch.Tensor, int]:
         b, s = llm_inputs["input_ids"].shape
         hiddens = self.get_suffix_hiddens(llm_inputs, suffix_idx)
         masked_gates = self.router(hiddens)
